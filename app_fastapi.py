@@ -522,7 +522,7 @@ def create_price_response(payload: PredictionRequest, price: float) -> Predictio
     return PredictionResponse(
         price_usd=round(price, 2),
         price_range={"low": round(price * 0.90, 2), "high": round(price * 1.10, 2)},
-        confidence=0.85,
+        confidence=0.9,
         input=model_to_dict(payload),
         derived={
             "age": age,
