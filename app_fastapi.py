@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -9,7 +11,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import shap
-import re
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -44,9 +45,14 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 ROOT = Path(__file__).resolve().parent.parent
+BACKEND_DIR = ROOT / "web_app"
 MODEL_PATH = ROOT / "data_cleaning" / "v2_data_cleaning" / "car_price_prediction_model.pkl"
 FEATURE_DATA_PATH = ROOT / "data_cleaning" / "v2_data_cleaning" / "feature_engineered_data.csv"
 RAW_DATA_PATH = ROOT / "data" / "used_cars_10M_2025.csv"
+DEPLOYMENT_MODEL_PATH = BACKEND_DIR / "models" / "car_price_prediction_model.pkl"
+FEATURE_SAMPLE_PATH = BACKEND_DIR / "models" / "feature_engineered_sample_50000.csv"
+RAW_SAMPLE_PATH = BACKEND_DIR / "data" / "used_cars_sample_50000.csv"
+BACKEND_CACHE_PATH = BACKEND_DIR / "models" / "backend_cache.json"
 
 CURRENT_YEAR = datetime.now().year
 RANDOM_STATE = 42
@@ -300,9 +306,57 @@ def feature_label(feature: str) -> str:
     return FEATURE_LABELS.get(feature, FEATURE_LABELS.get(raw_feature, raw_feature.replace("_", " ").title()))
 
 
+def inverse_scaled_value(feature: str, encoded_value: float) -> float:
+    """Convert a model-space numeric value back to the original user scale."""
+
+    scaler_params = load_scaler_params()
+    if feature not in scaler_params:
+        return float(encoded_value)
+
+    raw_value = encoded_value * scaler_params[feature]["std"] + scaler_params[feature]["mean"]
+    if feature == "condition_score":
+        # The model uses condition on a 0..1 scale, while the UI asks for 0..10.
+        return float(raw_value * 10)
+    return float(raw_value)
+
+
+def format_feature_value(feature: str, raw_value: float) -> str:
+    """Format an original-scale feature value for chart axes and tooltips."""
+
+    if feature == "mileage_km":
+        return f"{raw_value:,.0f} km"
+    if feature == "mileage_per_year":
+        return f"{raw_value:,.0f} km/year"
+    if feature == "horsepower":
+        return f"{raw_value:,.0f} HP"
+    if feature == "condition_score":
+        return f"{max(0, min(10, raw_value)):.1f}/10"
+    if feature == "doors":
+        return f"{raw_value:.0f} doors"
+    if feature == "age":
+        return f"{raw_value:.0f} years"
+    if feature == "year":
+        return f"{raw_value:.0f}"
+    return f"{raw_value:,.2f}"
+
+
+def pdp_point(feature: str, encoded_value: float, price: float) -> Dict[str, Any]:
+    """Build one PDP point with both model-space and display-space x values."""
+
+    raw_value = inverse_scaled_value(feature, encoded_value)
+    return {
+        "feature_value": round(float(encoded_value), 5),
+        "feature_value_raw": round(raw_value, 4),
+        "feature_value_label": format_feature_value(feature, raw_value),
+        "predicted_price_usd": round(float(price), 2),
+    }
+
+
 @lru_cache(maxsize=1)
 def get_model():
-    return joblib.load(MODEL_PATH)
+    # Prefer the small deployable backend model path, but keep the notebook path as a fallback.
+    model_path = DEPLOYMENT_MODEL_PATH if DEPLOYMENT_MODEL_PATH.exists() else MODEL_PATH
+    return joblib.load(model_path)
 
 
 @lru_cache(maxsize=1)
@@ -325,7 +379,10 @@ def normalize_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def get_feature_sample() -> pd.DataFrame:
-    sample_df = pd.read_csv(FEATURE_DATA_PATH, nrows=2500)
+    # Deployment should use the 50k sample created by build_backend_cache.py.
+    # The large notebook CSV is only a local fallback.
+    feature_path = FEATURE_SAMPLE_PATH if FEATURE_SAMPLE_PATH.exists() else FEATURE_DATA_PATH
+    sample_df = pd.read_csv(feature_path, nrows=2500)
     sample_df = sample_df.drop(columns=["Unnamed: 0"], errors="ignore")
     return normalize_feature_columns(sample_df)
 
@@ -357,7 +414,26 @@ def get_shap_sample_values() -> np.ndarray:
 
 
 @lru_cache(maxsize=1)
+def load_backend_cache() -> Dict[str, Any]:
+    """Load one-time statistics generated from the full dataset.
+
+    This avoids reading the 3GB raw CSV during normal API startup/deployment.
+    If the JSON has not been generated yet, the old full-CSV code paths below
+    still work locally.
+    """
+
+    if not BACKEND_CACHE_PATH.exists():
+        return {}
+    with BACKEND_CACHE_PATH.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+@lru_cache(maxsize=1)
 def load_target_maps() -> Tuple[Dict[str, Dict[str, float]], float]:
+    cached = load_backend_cache()
+    if cached.get("target_maps") and cached.get("default_target_mean") is not None:
+        return cached["target_maps"], float(cached["default_target_mean"])
+
     cols = ["brand", "model", "city", "color"]
     maps: Dict[str, Dict[str, List[float]]] = {col: {} for col in cols}
     total_sum = 0.0
@@ -386,6 +462,10 @@ def load_target_maps() -> Tuple[Dict[str, Dict[str, float]], float]:
 
 @lru_cache(maxsize=1)
 def load_scaler_params() -> Dict[str, Dict[str, float]]:
+    cached = load_backend_cache()
+    if cached.get("scaler_params"):
+        return cached["scaler_params"]
+
     cols = ["year", "mileage_km", "horsepower", "doors", "condition_score"]
     stats = {col: {"sum": 0.0, "sum_sq": 0.0, "count": 0} for col in cols}
     stats["age"] = {"sum": 0.0, "sum_sq": 0.0, "count": 0}
@@ -416,6 +496,19 @@ def load_scaler_params() -> Dict[str, Dict[str, float]]:
         var = (stat["sum_sq"] / stat["count"] - mean * mean) if stat["count"] else 0.0
         scaler[key] = {"mean": mean, "std": float(np.sqrt(var) if var > 0 else 1.0)}
     return scaler
+
+
+@lru_cache(maxsize=1)
+def get_raw_sample() -> pd.DataFrame:
+    """Load a deployable sample of original car rows for budget suggestions."""
+
+    raw_path = RAW_SAMPLE_PATH if RAW_SAMPLE_PATH.exists() else RAW_DATA_PATH
+    columns = [
+        "brand", "model", "year", "mileage_km", "price_usd", "fuel_type",
+        "transmission", "horsepower", "doors", "color", "condition_score",
+        "country", "city",
+    ]
+    return pd.read_csv(raw_path, usecols=columns, nrows=50_000).dropna(subset=["price_usd"])
 
 
 def encode_features(payload: PredictionRequest) -> pd.DataFrame:
@@ -742,7 +835,7 @@ def partial_dependence_summary() -> List[Dict[str, Any]]:
             "feature": feature,
             "label": feature_label(feature),
             "points": [
-                {"feature_value": round(float(x), 5), "predicted_price_usd": round(float(y), 2)}
+                pdp_point(feature, float(x), float(y))
                 for x, y in zip(grid, prices)
             ],
         })
@@ -920,12 +1013,16 @@ def price_effects(payload: PredictionRequest) -> Dict[str, Any]:
             "change": change_label,
             "current_engineered_value": round(current_value, 5),
             "changed_engineered_value": round(changed_value, 5),
+            "current_display_value": format_feature_value(feature, inverse_scaled_value(feature, current_value)),
+            "changed_display_value": format_feature_value(feature, inverse_scaled_value(feature, changed_value)),
             "current_pdp_price_usd": round(current_pdp_price, 2),
             "changed_pdp_price_usd": round(changed_pdp_price, 2),
             "delta_usd": round(delta, 2),
             "pdp_points": pdp["points"],
             "text": (
-                f"For {feature_label(feature)}, the PDP curve estimates that {change_label} "
+                f"For {feature_label(feature)}, moving from "
+                f"{format_feature_value(feature, inverse_scaled_value(feature, current_value))} to "
+                f"{format_feature_value(feature, inverse_scaled_value(feature, changed_value))} "
                 f"{'adds' if delta >= 0 else 'costs'} about ${abs(delta):,.0f}."
             ),
         })
@@ -958,64 +1055,85 @@ def global_summary_payload() -> Dict[str, Any]:
 
 
 def generate_counterfactuals(payload: CounterfactualRequest) -> Dict[str, Any]:
-    request_payload = PredictionRequest(**model_to_dict(payload, exclude={"budget"}))
-    input_df, _, base_price = predict_price_from_payload(request_payload)
+    """Suggest budget-friendly cars using original, human-readable features.
 
-    if dice_ml is not None:
-        try:
-            X = get_x_sample().astype(np.float32)
-            dice_df = pd.concat(
-                [X.reset_index(drop=True), pd.Series(np.expm1(get_y_sample()), name="price_usd").reset_index(drop=True)],
-                axis=1,
-            )
-            dice_data = DiceData(
-                dataframe=dice_df,
-                continuous_features=list(X.columns),
-                outcome_name="price_usd",
-            )
-            dice_model = DiceModel(model=get_model(), backend="sklearn", model_type="regressor")
-            dice_explainer = Dice(dice_data, dice_model, method="random")
-            counterfactuals = dice_explainer.generate_counterfactuals(
-                input_df.astype(np.float32),
-                total_CFs=3,
-                desired_range=[payload.budget * 0.97, payload.budget * 1.03],
-                features_to_vary=list(input_df.columns),
-            )
-            cf_df = counterfactuals.cf_examples_list[0].final_cfs_df
-            return {
-                "counterfactuals": [
-                    {key: round(float(value), 4) for key, value in row.items()}
-                    for row in cf_df.to_dict(orient="records")
-                ],
-                "graph": {"recommended": "comparison table", "note": "Show current encoded values next to each counterfactual row."},
-                "note": "Generated with DiCE around the requested budget.",
-            }
-        except Exception:
-            pass
+    DiCE needs a starting input, but for the "find my car by budget" UI the
+    user mostly needs realistic car suggestions. We therefore rank real rows
+    from a 50k original-data sample by budget closeness, quality, and light
+    similarity to the submitted car instead of returning encoded model vectors.
+    """
 
+    sample = get_raw_sample().copy()
+    sample["price_usd"] = pd.to_numeric(sample["price_usd"], errors="coerce")
+    sample["mileage_km"] = pd.to_numeric(sample["mileage_km"], errors="coerce")
+    sample["year"] = pd.to_numeric(sample["year"], errors="coerce")
+    sample["horsepower"] = pd.to_numeric(sample["horsepower"], errors="coerce")
+    sample["condition_score"] = pd.to_numeric(sample["condition_score"], errors="coerce")
+    sample = sample.dropna(subset=["price_usd", "year", "mileage_km"])
+
+    price_distance = (sample["price_usd"] - payload.budget).abs()
+    price_score = 1 - (price_distance / max(payload.budget, 1)).clip(upper=1)
+    condition_score = (sample["condition_score"].fillna(sample["condition_score"].median()) / 10).clip(0, 1)
+    mileage_score = (1 - (sample["mileage_km"].fillna(sample["mileage_km"].median()) / 250_000)).clip(0, 1)
+    year_score = ((sample["year"].fillna(sample["year"].median()) - 1995) / max(CURRENT_YEAR - 1995, 1)).clip(0, 1)
+    brand_match = sample["brand"].astype(str).str.lower().eq(payload.brand.lower()).astype(float)
+    requested_fuel = {"petrol": "gasoline", "lpg": "gasoline"}.get(
+        normalize_fuel(payload.fuel_type),
+        normalize_fuel(payload.fuel_type),
+    )
+    fuel_match = sample["fuel_type"].astype(str).str.lower().eq(requested_fuel).astype(float)
+
+    sample["_score"] = (
+        price_score * 0.55
+        + condition_score * 0.15
+        + mileage_score * 0.12
+        + year_score * 0.10
+        + brand_match * 0.05
+        + fuel_match * 0.03
+    )
+
+    rows = sample.sort_values(["_score", "price_usd"], ascending=[False, True]).head(6)
     suggestions = []
-    candidate_updates = [
-        {"mileage_km": max(0.0, request_payload.mileage_km - 20_000)},
-        {"year": min(CURRENT_YEAR, request_payload.year + 1)},
-        {"condition_score": min(10.0, request_payload.condition_score + 1)},
-        {"horsepower": request_payload.horsepower + 50},
-        {"mileage_km": request_payload.mileage_km + 20_000, "year": max(1995, request_payload.year - 1)},
-    ]
-    for update in candidate_updates:
-        candidate = copy_model(request_payload, **update)
-        _, _, candidate_price = predict_price_from_payload(candidate)
+    for _, row in rows.iterrows():
+        brand = str(row.get("brand", "Unknown")).strip() or "Unknown"
+        model_name = str(row.get("model", "Model")).strip() or "Model"
+        price = float(row["price_usd"])
+        mileage = float(row.get("mileage_km", 0) or 0)
+        year = int(round(float(row.get("year", CURRENT_YEAR))))
+        horsepower = float(row.get("horsepower", 0) or 0)
+        condition = float(row.get("condition_score", 0) or 0)
+        doors_value = row.get("doors", 0)
+        doors = 0 if pd.isna(doors_value) else int(doors_value)
         suggestions.append({
-            "changed_fields": update,
-            "estimated_price_usd": round(candidate_price, 2),
-            "distance_from_budget_usd": round(candidate_price - payload.budget, 2),
-            "current_price_delta_usd": round(candidate_price - base_price, 2),
+            "car_name": f"{year} {brand} {model_name}",
+            "brand": brand,
+            "model": model_name,
+            "year": year,
+            "estimated_price_usd": round(price, 2),
+            "distance_from_budget_usd": round(price - payload.budget, 2),
+            "mileage_km": round(mileage),
+            "horsepower": round(horsepower),
+            "doors": doors,
+            "condition_score": round(condition, 1),
+            "fuel_type": str(row.get("fuel_type", "Unknown")),
+            "transmission": str(row.get("transmission", "Unknown")),
+            "country": str(row.get("country", "Unknown")),
+            "city": str(row.get("city", "Unknown")),
+            "color": str(row.get("color", "Unknown")),
+            "match_score": round(float(row["_score"]), 4),
+            "reason": (
+                f"Close to your ${payload.budget:,.0f} budget with "
+                f"{mileage:,.0f} km, {condition:.1f}/10 condition, and {horsepower:,.0f} HP."
+            ),
         })
 
-    suggestions = sorted(suggestions, key=lambda row: abs(row["distance_from_budget_usd"]))[:3]
     return {
         "counterfactuals": suggestions,
-        "graph": {"recommended": "ranked comparison table", "note": "Sort by absolute distance_from_budget_usd."},
-        "note": "DiCE was unavailable or could not find valid rows, so these are deterministic what-if suggestions.",
+        "graph": {
+            "recommended": "ranked recommendation cards",
+            "note": "Rows are real original-feature cars from the 50k deployable sample, ranked by budget fit and quality.",
+        },
+        "note": "Budget suggestions use the submitted budget plus a light similarity signal from your last car input; they are displayed in original car features, not encoded model values.",
     }
 
 
@@ -1023,8 +1141,10 @@ def generate_counterfactuals(payload: CounterfactualRequest) -> Dict[str, Any]:
 async def health():
     return {
         "status": "ok",
-        "model_loaded": MODEL_PATH.exists(),
-        "feature_data_loaded": FEATURE_DATA_PATH.exists(),
+        "model_loaded": DEPLOYMENT_MODEL_PATH.exists() or MODEL_PATH.exists(),
+        "feature_data_loaded": FEATURE_SAMPLE_PATH.exists() or FEATURE_DATA_PATH.exists(),
+        "backend_cache_loaded": BACKEND_CACHE_PATH.exists(),
+        "raw_sample_loaded": RAW_SAMPLE_PATH.exists(),
         "xai_features": [
             "feature engineering",
             "prediction",
