@@ -61,7 +61,10 @@ app = FastAPI(title="Car Price Prediction API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8080",  # Local development (Vite dev server)
+        "hhttps://car-prediction-insights.vercel.app/",  # TODO: Uncomment and set your production Vercel frontend URL
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
