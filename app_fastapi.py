@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = ROOT / "web_app"
+BACKEND_DIR = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "data_cleaning" / "v2_data_cleaning" / "car_price_prediction_model.pkl"
 FEATURE_DATA_PATH = ROOT / "data_cleaning" / "v2_data_cleaning" / "feature_engineered_data.csv"
 RAW_DATA_PATH = ROOT / "data" / "used_cars_10M_2025.csv"
